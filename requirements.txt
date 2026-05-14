@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+opencv-python-headless
+tensorflow-cpu
+tensorflow-hub
+numpy
