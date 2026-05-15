@@ -2,7 +2,8 @@
 
 Real-time AI gym coach that watches your form and tells you what to fix — powered by HeyGen and Gemini.
 
-<a href="https://www.youtube.com/watch?v=051Q-GHF1Fs" />
+https://www.youtube.com/watch?v=051Q-GHF1Fs
+
 
 ## How it works
 
