@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pose Coach</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; height: 100dvh;
+           font-family: 'Segoe UI', system-ui, sans-serif; color: #fff; }
+    #video { display: none; }
+    #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+
+    /* LiveAvatar — bottom-left square */
+    #avatar-box {
+      position: fixed; bottom: 5.5rem; left: 1.5rem;
+      width: 160px; height: 160px; border-radius: 1.2rem;
+      overflow: hidden;
+      border: 2px solid rgba(255,255,255,0.15);
+      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+      background: #111827;
+      display: none; z-index: 15;
+    }
+    #avatar-box.active { display: block; }
+    #avatar-box video {
+      width: 100%; height: 100%; object-fit: cover;
+    }
+
+    #coach {
+      position: fixed; top: 1.5rem; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.65); border: 1.5px solid rgba(255,255,255,0.18);
+      border-radius: 2rem; padding: 0.55rem 1.6rem; font-size: 1.5rem;
+      font-weight: 600; white-space: nowrap;
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      opacity: 0; transition: opacity 0.25s ease; pointer-events: none; z-index: 20;
+    }
+    #coach.show { opacity: 1; }
+    #bar {
+      position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 0.75rem; z-index: 20;
+    }
+    select {
+      appearance: none; background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.25); color: #fff;
+      padding: 0.5rem 1.1rem; border-radius: 1.5rem; font-size: 0.95rem;
+      font-family: inherit; cursor: pointer; backdrop-filter: blur(8px);
+    }
+    select option { background: #1a1a1a; }
+    #dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #6b7280; transition: background 0.3s; flex-shrink: 0;
+    }
+    #dot.live  { background: #4ade80; box-shadow: 0 0 6px #4ade80aa; }
+    #dot.error { background: #f87171; }
+    #status-text { font-size: 0.8rem; opacity: 0.55; }
+    #mic-btn {
+      width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
+      background: rgba(255,255,255,0.15); color: #fff; font-size: 1.1rem;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.2s, box-shadow 0.2s; flex-shrink: 0;
+    }
+    #mic-btn.listening {
+      background: #ef4444; box-shadow: 0 0 0 4px rgba(239,68,68,0.35);
+      animation: pulse 1s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(239,68,68,0.35); }
+      50%       { box-shadow: 0 0 0 8px rgba(239,68,68,0.15); }
+    }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="stage"></canvas>
+
+  <!-- LiveAvatar square widget — bottom-left -->
+  <div id="avatar-box">
+    <video id="avatar-video" autoplay playsinline></video>
+  </div>
+
+  <div id="coach"></div>
+  <div id="bar">
+    <select id="exercise">
+      <option value="squat">Squat</option>
+      <option value="deadlift">Deadlift</option>
+      <option value="pushup">Push-up</option>
+      <option value="lunge">Lunge</option>
+      <option value="plank">Plank</option>
+      <option value="bicep curl">Bicep Curl</option>
+      <option value="shoulder press">Shoulder Press</option>
+      <option value="row">Row</option>
+    </select>
+    <div id="dot"></div>
+    <span id="status-text">Loading model…</span>
+    <button id="mic-btn" title="Ask a question">🎤</button>
+  </div>
+
+  <script>
+  (() => {
+    // COCO-17 skeleton
+    const EDGES = [
+      [0,1],[0,2],[1,3],[2,4],
+      [5,6],[5,7],[7,9],[6,8],[8,10],
+      [5,11],[6,12],[11,12],
+      [11,13],[13,15],[12,14],[14,16],
+    ];
+    const KP_NAMES = [
+      'nose','left_eye','right_eye','left_ear','right_ear',
+      'left_shoulder','right_shoulder','left_elbow','right_elbow',
+      'left_wrist','right_wrist','left_hip','right_hip',
+      'left_knee','right_knee','left_ankle','right_ankle',
+    ];
+
+    function landmarkColor(i) {
+      if (i <= 4)  return '#94a3b8';
+      if (i <= 10) return '#34d399';
+      if (i <= 12) return '#60a5fa';
+      return '#fb923c';
+    }
+    function edgeColor(a, b) {
+      const m = Math.max(a, b);
+      if (m <= 4)  return 'rgba(148,163,184,0.55)';
+      if (m <= 10) return 'rgba(52,211,153,0.75)';
+      if (m <= 12) return 'rgba(96,165,250,0.75)';
+      return 'rgba(251,146,60,0.75)';
+    }
+
+    // DOM
+    const video     = document.getElementById('video');
+    const canvas    = document.getElementById('stage');
+    const ctx       = canvas.getContext('2d');
+    const avatarBox = document.getElementById('avatar-box');
+    const avatarVid = document.getElementById('avatar-video');
+    const coachEl   = document.getElementById('coach');
+    const exSel     = document.getElementById('exercise');
+    const dot       = document.getElementById('dot');
+    const statusTx  = document.getElementById('status-text');
+
+    let latestKp   = null;
+    let ws         = null;
+    let coachTimer = null;
+    let laRoom     = null;
+    let laSession  = null;
+    const micBtn   = document.getElementById('mic-btn');
+
+    function showCoach(text) {
+      coachEl.textContent = text;
+      coachEl.classList.add('show');
+      clearTimeout(coachTimer);
+      coachTimer = setTimeout(() => coachEl.classList.remove('show'), 6000);
+    }
+    function setStatus(cls, text) {
+      dot.className = cls;
+      statusTx.textContent = text;
+    }
+
+    // ------------------------------------------------------------------
+    // LiveAvatar — connect via LiveKit, speak coach cues
+    // ------------------------------------------------------------------
+    async function initLiveAvatar() {
+      try {
+        const res = await fetch('/liveavatar/session');
+        const data = await res.json();
+        if (data.error) { console.warn('LiveAvatar error:', data.error, data.detail); return; }
+
+        laSession = data;
+        laRoom = new LivekitClient.Room();
+
+        laRoom.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _pub, _participant) => {
+          if (track.kind === LivekitClient.Track.Kind.Video) {
+            track.attach(avatarVid);
+            avatarBox.classList.add('active');
+          } else if (track.kind === LivekitClient.Track.Kind.Audio) {
+            const el = track.attach();
+            document.body.appendChild(el);
+          }
+        });
+
+        laRoom.on(LivekitClient.RoomEvent.Disconnected, () => {
+          avatarBox.classList.remove('active');
+          console.warn('LiveAvatar disconnected');
+        });
+
+        await laRoom.connect(data.livekit_url, data.livekit_token);
+        console.log('LiveAvatar connected — session', data.session_id);
+      } catch (err) {
+        console.warn('LiveAvatar init failed:', err);
+      }
+    }
+
+    function avatarSpeak(text) {
+      if (!laRoom || laRoom.state !== LivekitClient.ConnectionState.Connected) return;
+      if (!laSession) return;
+      const encoder = new TextEncoder();
+      const payload = encoder.encode(JSON.stringify({
+        event_id:      crypto.randomUUID(),
+        event_type:    'avatar.speak_text',
+        session_id:    laSession.session_id,
+        source_event_id: null,
+        text,
+      }));
+      laRoom.localParticipant.publishData(payload, { topic: 'agent-control' });
+    }
+
+    // ------------------------------------------------------------------
+    // Speech recognition — ask the coach questions
+    // ------------------------------------------------------------------
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recog = null;
+    let listening = false;
+
+    if (SpeechRecognition) {
+      recog = new SpeechRecognition();
+      recog.lang = 'en-US';
+      recog.continuous = false;
+      recog.interimResults = false;
+
+      recog.onresult = (e) => {
+        const question = e.results[0][0].transcript.trim();
+        if (question && ws?.readyState === WebSocket.OPEN) {
+          avatarInterrupt();
+          showCoach(`"${question}"`);
+          ws.send(JSON.stringify({ type: 'question', text: question }));
+        }
+      };
+      recog.onend = () => {
+        listening = false;
+        micBtn.classList.remove('listening');
+      };
+      recog.onerror = () => {
+        listening = false;
+        micBtn.classList.remove('listening');
+      };
+
+      micBtn.addEventListener('click', () => {
+        if (listening) {
+          recog.stop();
+        } else {
+          listening = true;
+          micBtn.classList.add('listening');
+          recog.start();
+        }
+      });
+    } else {
+      micBtn.title = 'Speech recognition not supported in this browser';
+      micBtn.style.opacity = '0.3';
+      micBtn.disabled = true;
+    }
+
+    function avatarInterrupt() {
+      if (!laRoom || laRoom.state !== LivekitClient.ConnectionState.Connected || !laSession) return;
+      const encoder = new TextEncoder();
+      const payload = encoder.encode(JSON.stringify({
+        event_id:        crypto.randomUUID(),
+        event_type:      'avatar.interrupt',
+        session_id:      laSession.session_id,
+        source_event_id: null,
+      }));
+      laRoom.localParticipant.publishData(payload, { topic: 'agent-control' });
+    }
+
+    // ------------------------------------------------------------------
+    // WebSocket — pose snapshots + coach text
+    // ------------------------------------------------------------------
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/stream`);
+      ws.onopen = () => {
+        setStatus('live', 'Live');
+        ws.send(JSON.stringify({ exercise: exSel.value }));
+      };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'coach') {
+          showCoach(msg.text);
+          avatarSpeak(msg.text);
+        } else if (msg.type === 'answer') {
+          showCoach(msg.text);
+          avatarSpeak(msg.text);
+        }
+      };
+      ws.onclose = () => {
+        setStatus('error', 'Reconnecting…');
+        setTimeout(connect, 2000);
+      };
+      ws.onerror = () => ws.close();
+    }
+
+    exSel.addEventListener('change', () => {
+      if (ws?.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ exercise: exSel.value }));
+    });
+
+    // ------------------------------------------------------------------
+    // Joint angle computation
+    // ------------------------------------------------------------------
+    function angleDeg(a, b, c) {
+      if (!a?.v || !b?.v || !c?.v) return null;
+      const ax = a.x - b.x, ay = a.y - b.y;
+      const cx = c.x - b.x, cy = c.y - b.y;
+      const dot = ax * cx + ay * cy;
+      const mag = Math.sqrt((ax * ax + ay * ay) * (cx * cx + cy * cy));
+      if (mag === 0) return null;
+      return Math.round(Math.acos(Math.max(-1, Math.min(1, dot / mag))) * 180 / Math.PI);
+    }
+
+    function computeAngles(kp) {
+      const angles = {};
+      const lKnee  = angleDeg(kp[11], kp[13], kp[15]);
+      const rKnee  = angleDeg(kp[12], kp[14], kp[16]);
+      const lElbow = angleDeg(kp[5],  kp[7],  kp[9]);
+      const rElbow = angleDeg(kp[6],  kp[8],  kp[10]);
+      const lHip   = angleDeg(kp[5],  kp[11], kp[13]);
+      const rHip   = angleDeg(kp[6],  kp[12], kp[14]);
+
+      let spineLean = null;
+      if (kp[5]?.v && kp[6]?.v && kp[11]?.v && kp[12]?.v) {
+        const sm = { x: (kp[5].x + kp[6].x) / 2, y: (kp[5].y + kp[6].y) / 2 };
+        const hm = { x: (kp[11].x + kp[12].x) / 2, y: (kp[11].y + kp[12].y) / 2 };
+        spineLean = Math.round(Math.abs(Math.atan2(Math.abs(sm.x - hm.x), Math.abs(sm.y - hm.y)) * 180 / Math.PI));
+      }
+
+      if (lKnee  !== null) angles.left_knee   = lKnee;
+      if (rKnee  !== null) angles.right_knee  = rKnee;
+      if (lElbow !== null) angles.left_elbow  = lElbow;
+      if (rElbow !== null) angles.right_elbow = rElbow;
+      if (lHip   !== null) angles.left_hip    = lHip;
+      if (rHip   !== null) angles.right_hip   = rHip;
+      if (spineLean !== null) angles.spine_lean = spineLean;
+      return angles;
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot sender (every 500ms)
+    // ------------------------------------------------------------------
+    let lastSnapshotAt = 0;
+
+    function maybeSendSnapshot() {
+      const now = performance.now();
+      if (now - lastSnapshotAt < 500) return;
+      if (ws?.readyState !== WebSocket.OPEN || !latestKp) return;
+      lastSnapshotAt = now;
+      const angles = computeAngles(latestKp);
+      if (Object.keys(angles).length === 0) return;
+      const lines = Object.entries(angles).map(([k, v]) => `  ${k}: ${v}°`);
+      ws.send(JSON.stringify({ type: 'keypoints', text: lines.join('\n') }));
+    }
+
+    // ------------------------------------------------------------------
+    // MoveNet detection loop
+    // ------------------------------------------------------------------
+    let detector = null;
+
+    async function detectLoop() {
+      if (detector && video.readyState >= 2) {
+        try {
+          const poses = await detector.estimatePoses(video);
+          if (poses.length > 0) {
+            const vw = video.videoWidth, vh = video.videoHeight;
+            latestKp = poses[0].keypoints.map(k => ({
+              x: k.x / vw, y: k.y / vh, v: (k.score ?? 0) > 0.3,
+            }));
+            maybeSendSnapshot();
+          }
+        } catch (_) {}
+      }
+      requestAnimationFrame(detectLoop);
+    }
+
+    // ------------------------------------------------------------------
+    // Draw loop — 60fps
+    // ------------------------------------------------------------------
+    function drawLoop() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      if (canvas.width !== vw || canvas.height !== vh) {
+        canvas.width = vw; canvas.height = vh;
+      }
+      const W = canvas.width, H = canvas.height;
+
+      if (video.readyState >= 2) {
+        ctx.save();
+        ctx.translate(W, 0); ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, W, H);
+        ctx.restore();
+      } else {
+        ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H);
+      }
+
+      if (latestKp?.length === 17) drawSkeleton(W, H);
+      requestAnimationFrame(drawLoop);
+    }
+
+    function drawSkeleton(W, H) {
+      function px(kp) { return [(1 - kp.x) * W, kp.y * H]; }
+      ctx.lineWidth = 2.5;
+      for (const [a, b] of EDGES) {
+        const ka = latestKp[a], kb = latestKp[b];
+        if (!ka?.v || !kb?.v) continue;
+        const [ax, ay] = px(ka), [bx, by] = px(kb);
+        ctx.strokeStyle = edgeColor(a, b);
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+      }
+      for (let i = 0; i < 17; i++) {
+        const kp = latestKp[i];
+        if (!kp?.v) continue;
+        const [x, y] = px(kp);
+        ctx.fillStyle = landmarkColor(i);
+        ctx.beginPath();
+        ctx.arc(x, y, i <= 4 ? 3.5 : 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Boot
+    // ------------------------------------------------------------------
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+      audio: false,
+    }).then(async stream => {
+      video.srcObject = stream;
+      await new Promise(r => video.onloadedmetadata = r);
+
+      await tf.ready();
+      detector = await poseDetection.createDetector(
+        poseDetection.SupportedModels.MoveNet,
+        { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING, enableSmoothing: true }
+      );
+
+      setStatus('', 'Connecting…');
+      connect();
+      initLiveAvatar();
+      requestAnimationFrame(detectLoop);
+      requestAnimationFrame(drawLoop);
+    }).catch(err => {
+      document.body.innerHTML =
+        `<p style="color:#f87171;padding:2rem;font-size:1.2rem">Camera error: ${err.message}</p>`;
+    });
+  })();
+  </script>
+</body>
+</html>

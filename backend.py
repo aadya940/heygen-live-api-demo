@@ -1,408 +1,292 @@
 """
-Backend — WebSocket frame receiver → MoveNet → sliding window → LLM context.
+Pose coaching backend.
 
-Flow:
-    Browser camera ──JPEG binary──► WebSocket /stream
-                                         │
-                                  thread pool executor
-                                  (non-blocking inference)
-                                         │
-                                   MoveNetInference        every frame
-                                         │
-                                    FrameBuffer            sliding window
-                                    (last N seconds)
-                                         │  flush every send_interval
-                                    ContextBatch ──JSON──► client / LLM service
+Pose detection runs in the browser (MoveNet/WebGL).
+This server handles:
+  - Receiving joint-angle snapshots from the frontend (every 500ms)
+  - Calling Gemini every ~4s for a short coaching cue
+  - Streaming the cue back over WebSocket
+  - Providing a LiveAvatar session for the avatar widget
 
-The ContextBatch contains:
-  - keypoint sequence for every frame in the window  (temporal motion context)
-  - a few evenly-sampled annotated images            (visual context for LLM)
+WebSocket /stream protocol
+--------------------------
+Client → Server:
+  {"exercise": "squat"}                         # session config / exercise change
+  {"type": "keypoints", "text": "...angles..."}  # joint-angle snapshot
 
-Frontend (minimal):
-    const ws = new WebSocket("ws://localhost:8000/stream")
-    ws.onopen  = () => ws.send(JSON.stringify({ exercise: "squat" }))
-    ws.onmessage = e => sendToLLM(JSON.parse(e.data))
-
-    function sendFrame() {
-        canvas.toBlob(blob => ws.readyState === 1 && ws.send(blob), "image/jpeg", 0.75)
-        requestAnimationFrame(sendFrame)
-    }
-    sendFrame()
-
-Run:
-    uvicorn backend:app --host 0.0.0.0 --port 8000
+Server → Client:
+  {"type": "coach", "text": "..."}  # every ~4s
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
+import os
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-import cv2
-import numpy as np
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
-from movenet import FrameContext, KP, Keypoints, MoveNetInference
-
-# One thread pool shared across all connections for MoveNet inference.
-# MoveNet is CPU/GPU bound — running it in a thread keeps the event loop free.
-_executor = ThreadPoolExecutor(max_workers=4)
+from pose import SKELETON_EDGES
 
 # ---------------------------------------------------------------------------
-# ContextBatch — one window of frames sent to the LLM
+# Gemini coach
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ContextBatch:
-    """
-    A sliding-window snapshot of the last `window_seconds` of motion.
+try:
+    from google import genai as genai_lib
+    _GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    _GEMINI_OK  = bool(_GEMINI_KEY)
+except ImportError:
+    genai_lib  = None  # type: ignore[assignment]
+    _GEMINI_OK = False
 
-    exercise          — label set by the client
-    timestamp         — Unix time this batch was built
-    window_seconds    — duration of the captured window
-    frame_count       — number of MoveNet frames in the window
-    keypoints_sequence — keypoints for every frame [{name: {x,y,conf}}, ...]
-    sampled_images    — base64 JPEGs evenly sampled from the window
-    batch_index       — monotonically increasing per connection
-    """
-    exercise:           Optional[str]
-    timestamp:          float
-    window_seconds:     float
-    frame_count:        int
-    keypoints_sequence: list[dict[str, dict]]
-    sampled_images:     list[str]               # base64 JPEGs
-    batch_index:        int
+_COACH_SYSTEM = (
+    "You are a strict real-time gym coach. "
+    "You receive joint angles in degrees for the user's current exercise. "
+    "Typical good-form targets: squat knee 70-100°, hip 60-90°, spine lean <30°; "
+    "deadlift hip 45-90°, knee 100-140°, spine lean <20°; "
+    "pushup elbow 70-100° at bottom; lunge knee 80-100°; "
+    "bicep curl elbow 30-60° at top; shoulder press elbow 160-180° at top. "
+    "Be HONEST — if angles are off, say exactly what to fix. "
+    "When form is reasonable (within ~15° of target), occasionally give warm encouragement: "
+    "'Great depth!', 'Looking strong!', 'Nice form!', 'Keep it up!', 'Solid rep!'. "
+    "Mix encouragement and corrections naturally — don't always correct, don't always praise. "
+    "Reply 3 to 7 words ONLY. "
+    "NEVER ask for more data or say you need angles — always give a coaching cue with what you have."
+)
 
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), default=lambda x: float(x) if hasattr(x, "__float__") else x)
+_QA_SYSTEM = (
+    "You are a knowledgeable gym coach. "
+    "Answer the user's question about exercise form, technique, or fitness. "
+    "Be specific and helpful. Reply in 1-2 sentences only — short enough to speak aloud."
+)
 
-    def to_anthropic_messages(self) -> list[dict]:
-        """
-        Format for client.messages.create(messages=...).
-        Sends sampled images as vision blocks + keypoint sequence as text.
-        """
-        content: list[dict] = []
+_COACH_INTERVAL = 4.0
+_MAX_SNAPSHOTS  = 30
 
-        for img_b64 in self.sampled_images:
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
-            })
+_gemini_client = None
 
-        kp_text = _format_keypoint_sequence(self.keypoints_sequence)
-        meta = (
-            f"Exercise: {self.exercise or 'unknown'}\n"
-            f"Window: {self.window_seconds:.1f}s  |  "
-            f"Frames: {self.frame_count}  |  "
-            f"Images shown: {len(self.sampled_images)}\n\n"
-            f"{kp_text}"
+
+async def _answer_question(question: str, exercise: Optional[str]) -> str:
+    text = (
+        f"{_QA_SYSTEM}\n\n"
+        f"Current exercise: {exercise or 'unknown'}\n\n"
+        f"User question: {question}"
+    )
+    resp = await _gemini_client.aio.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=text,
+    )
+    # Trim to 2 sentences for comfortable avatar speech
+    raw = resp.text.replace("\n", " ").strip()
+    parts = [s.strip() for s in raw.split(".") if s.strip()]
+    return ". ".join(parts[:2]) + "."
+
+
+async def _call_gemini(exercise: Optional[str], snapshots: list[str]) -> str:
+    recent = snapshots[-1]
+    text   = (
+        f"{_COACH_SYSTEM}\n\n"
+        f"Exercise: {exercise or 'unknown'}\n\n"
+        f"Current joint angles (degrees):\n{recent}"
+    )
+    resp = await _gemini_client.aio.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=text,
+    )
+    first_line = next(
+        (ln.strip() for ln in resp.text.splitlines() if ln.strip()), ""
+    )
+    return first_line
+
+
+# ---------------------------------------------------------------------------
+# LiveAvatar (HeyGen) — session management for the frontend avatar widget
+# ---------------------------------------------------------------------------
+
+_LA_BASE   = "https://api.liveavatar.com"
+_LA_KEY    = os.getenv("HEYGEN_API_KEY")
+_LA_AVATAR = os.getenv("LIVEAVATAR_AVATAR_ID", "65f9e3c9-d48b-4118-b73a-4ae2e3cbb8f0")
+_LA_OK     = bool(_LA_KEY)
+
+
+async def _la_create_session() -> dict:
+    """Create a LiveAvatar FULL-mode session and return LiveKit credentials."""
+    async with httpx.AsyncClient() as c:
+        # Step 1: get session token
+        r = await c.post(
+            f"{_LA_BASE}/v1/sessions/token",
+            headers={"X-API-KEY": _LA_KEY, "Content-Type": "application/json"},
+            json={
+                "mode": "FULL",
+                "avatar_id": _LA_AVATAR,
+                "avatar_persona": {"language": "en"},
+            },
+            timeout=15.0,
         )
-        content.append({"type": "text", "text": meta})
+        r.raise_for_status()
+        token_data = r.json()["data"]
+        session_id    = token_data["session_id"]
+        session_token = token_data["session_token"]
 
-        return [{"role": "user", "content": content}]
-
-
-def _format_keypoint_sequence(seq: list[dict[str, dict]]) -> str:
-    """Compact text representation of keypoint motion across frames."""
-    if not seq:
-        return ""
-    lines = [f"Keypoint motion across {len(seq)} frames:"]
-    # Only include body keypoints relevant to form (skip face)
-    tracked = [
-        "left_shoulder", "right_shoulder",
-        "left_elbow",    "right_elbow",
-        "left_wrist",    "right_wrist",
-        "left_hip",      "right_hip",
-        "left_knee",     "right_knee",
-        "left_ankle",    "right_ankle",
-    ]
-    for name in tracked:
-        positions = [
-            f"({f[name]['x']:.2f},{f[name]['y']:.2f})"
-            for f in seq
-            if name in f and f[name]["visible"]
-        ]
-        if positions:
-            # Downsample to at most 10 positions for brevity
-            step = max(1, len(positions) // 10)
-            lines.append(f"  {name}: {' → '.join(positions[::step])}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# FrameBuffer — sliding window of keypoints + raw frames
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Frame:
-    keypoints: dict[str, dict]
-    raw:       np.ndarray       # BGR, for image sampling
-    captured_at: float
-
-
-class FrameBuffer:
-    """
-    Accumulates MoveNet output for a rolling time window.
-    Thread-safe: add() is called from the executor thread,
-    flush() from the async handler.
-    """
-
-    def __init__(
-        self,
-        window_seconds: float = 2.0,
-        sampled_images: int   = 4,
-        jpeg_quality:   int   = 70,
-        conf_threshold: float = 0.3,
-    ):
-        self.window_seconds = window_seconds
-        self.n_images       = sampled_images
-        self.jpeg_quality   = jpeg_quality
-        self.conf_threshold = conf_threshold
-        self._buf: deque[_Frame] = deque()
-
-    def add(self, frame: np.ndarray, kp: Keypoints) -> None:
-        now = time.monotonic()
-        self._buf.append(_Frame(
-            keypoints=kp.to_dict(self.conf_threshold),
-            raw=frame,
-            captured_at=now,
-        ))
-        # Evict frames outside the window
-        cutoff = now - self.window_seconds
-        while self._buf and self._buf[0].captured_at < cutoff:
-            self._buf.popleft()
-
-    def build(
-        self,
-        exercise:    Optional[str],
-        batch_index: int,
-        model:       MoveNetInference,
-    ) -> Optional[ContextBatch]:
-        if not self._buf:
-            return None
-
-        frames = list(self._buf)
-        kp_seq = [f.keypoints for f in frames]
-
-        # Sample N evenly spaced frames for images
-        indices = _even_indices(len(frames), self.n_images)
-        images  = [
-            _encode_jpeg(
-                model.draw_skeleton(
-                    frames[i].raw,
-                    _reconstruct_kp(frames[i].keypoints),
-                ),
-                self.jpeg_quality,
-            )
-            for i in indices
-        ]
-
-        duration = frames[-1].captured_at - frames[0].captured_at if len(frames) > 1 else 0.0
-
-        return ContextBatch(
-            exercise=exercise,
-            timestamp=time.time(),
-            window_seconds=duration,
-            frame_count=len(frames),
-            keypoints_sequence=kp_seq,
-            sampled_images=images,
-            batch_index=batch_index,
+        # Step 2: start session → get LiveKit URL + client token
+        r2 = await c.post(
+            f"{_LA_BASE}/v1/sessions/start",
+            headers={"Authorization": f"Bearer {session_token}"},
+            timeout=15.0,
         )
+        r2.raise_for_status()
+        start_data = r2.json()["data"]
 
-    def clear(self) -> None:
-        self._buf.clear()
-
-
-def _even_indices(total: int, n: int) -> list[int]:
-    if total <= n:
-        return list(range(total))
-    step = total / n
-    return [int(i * step) for i in range(n)]
-
-
-def _encode_jpeg(frame: np.ndarray, quality: int) -> str:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        raise RuntimeError("JPEG encode failed.")
-    return base64.b64encode(buf).decode("utf-8")
-
-
-def _reconstruct_kp(kp_dict: dict[str, dict]) -> Keypoints:
-    """Reconstruct a Keypoints object from its serialised dict for draw_skeleton."""
-    name_to_idx = {v.name.lower(): int(v) for v in KP}
-    arr = np.zeros((17, 3), dtype=np.float32)
-    for name, v in kp_dict.items():
-        idx = name_to_idx.get(name)
-        if idx is not None:
-            arr[idx] = [v["y"], v["x"], v["confidence"]]
-    return Keypoints(data=arr)
-
-
-def _decode_jpeg(data: bytes) -> Optional[np.ndarray]:
-    arr   = np.frombuffer(data, dtype=np.uint8)
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return frame
+    return {
+        "session_id":    session_id,
+        "livekit_url":   start_data["livekit_url"],
+        "livekit_token": start_data["livekit_client_token"],
+    }
 
 
 # ---------------------------------------------------------------------------
-# Per-connection session
+# Per-connection coach session
 # ---------------------------------------------------------------------------
 
-class StreamSession:
-    """
-    State for one WebSocket connection.
-
-    Inference runs in a thread pool so it never blocks the event loop.
-    A flush fires every `send_interval` seconds, packaging whatever is
-    currently in the buffer and sending it to the client.
-    """
-
-    def __init__(
-        self,
-        model:          MoveNetInference,
-        exercise:       Optional[str] = None,
-        send_interval:  float         = 2.0,
-        window_seconds: float         = 2.0,
-        sampled_images: int           = 4,
-        jpeg_quality:   int           = 70,
-        conf_threshold: float         = 0.3,
-    ):
-        self._model         = model
+class CoachSession:
+    def __init__(self, exercise: Optional[str], coach_interval: float = _COACH_INTERVAL):
         self.exercise       = exercise
-        self.send_interval  = send_interval
-        self._buffer        = FrameBuffer(window_seconds, sampled_images,
-                                          jpeg_quality, conf_threshold)
-        self._batch_index   = 0
-        self._last_flush    = 0.0
+        self.coach_interval = coach_interval
+        self._snapshots: deque[str] = deque(maxlen=_MAX_SNAPSHOTS)
+        self._last_coach    = 0.0
+        self._coach_task: Optional[asyncio.Task] = None
+        self._coach_result: Optional[str]        = None
 
     def set_exercise(self, exercise: str) -> None:
-        """Changing exercise clears the buffer so stale motion doesn't bleed in."""
         self.exercise = exercise
-        self._buffer.clear()
-        self._last_flush = 0.0
+        self._snapshots.clear()
 
-    def infer(self, jpeg_bytes: bytes) -> None:
-        """Decode frame + run MoveNet. Called in thread pool — not async."""
-        frame = _decode_jpeg(jpeg_bytes)
-        if frame is None:
+    def add_snapshot(self, text: str) -> None:
+        self._snapshots.append(text)
+
+    def start_coach_if_due(self) -> None:
+        if not _GEMINI_OK or _gemini_client is None:
             return
-        kp = self._model.predict(frame)
-        self._buffer.add(frame, kp)
-
-    def try_flush(self) -> Optional[ContextBatch]:
-        """Return a batch if send_interval has elapsed, otherwise None."""
+        if self._coach_task and not self._coach_task.done():
+            return
         now = time.monotonic()
-        if now - self._last_flush < self.send_interval:
+        if now - self._last_coach < self.coach_interval:
+            return
+        if not self._snapshots:
+            return
+        self._last_coach = now
+        snapshots, exercise = list(self._snapshots), self.exercise
+
+        async def _run() -> None:
+            try:
+                self._coach_result = await _call_gemini(exercise, snapshots)
+            except Exception as exc:
+                print(f"Gemini error: {exc}")
+
+        self._coach_task = asyncio.create_task(_run())
+
+    def poll_coach(self) -> Optional[str]:
+        if not self._coach_task or not self._coach_task.done():
             return None
-        self._last_flush = now
-        self._batch_index += 1
-        return self._buffer.build(self.exercise, self._batch_index, self._model)
+        result = self._coach_result
+        self._coach_result = None
+        self._coach_task   = None
+        return result
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# FastAPI
 # ---------------------------------------------------------------------------
 
-_model: Optional[MoveNetInference] = None
-
-def get_model() -> MoveNetInference:
-    global _model
-    if _model is None:
-        _model = MoveNetInference.from_hub("lightning")
-    return _model
-
-
-app = FastAPI(title="MoveNet Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Pose Coach")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 @app.on_event("startup")
-async def load_model() -> None:
-    get_model()
-    print("MoveNet model loaded.")
+async def _startup() -> None:
+    global _gemini_client
+    if _GEMINI_OK:
+        _gemini_client = genai_lib.Client(api_key=_GEMINI_KEY)
+        print("Gemini coach ready.")
+    else:
+        print("GEMINI_API_KEY not set — coaching disabled.")
+    print(f"LiveAvatar {'ready' if _LA_OK else 'disabled'} — avatar={_LA_AVATAR!r}")
+
+
+@app.get("/")
+async def serve_ui():
+    return FileResponse("index.html")
+
+
+@app.get("/init")
+async def get_init():
+    return {"skeleton_edges": SKELETON_EDGES}
+
+
+@app.get("/liveavatar/session")
+async def liveavatar_session():
+    if not _LA_OK:
+        return {"error": "HEYGEN_API_KEY not set"}
+    try:
+        return await _la_create_session()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"LiveAvatar {e.response.status_code}", "detail": e.response.text}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.websocket("/stream")
 async def stream(websocket: WebSocket) -> None:
-    """
-    WebSocket endpoint.
-
-    Client → server messages:
-      1. First message (text JSON) — session config:
-             {"exercise": "squat", "send_interval": 2.0, "window_seconds": 2.0}
-      2. Binary messages — JPEG frame bytes (every animation frame)
-      3. Text messages at any time — update exercise:
-             {"exercise": "deadlift"}
-
-    Server → client messages:
-      - ContextBatch JSON every send_interval seconds
-    """
     await websocket.accept()
-    loop = asyncio.get_event_loop()
 
-    # Parse config from first message — must be text JSON.
     try:
         first = await websocket.receive()
-        config_raw = first.get("text") or (first.get("bytes") or b"{}").decode()
-        config = json.loads(config_raw)
+        cfg   = json.loads(first.get("text") or (first.get("bytes") or b"{}").decode())
     except Exception as exc:
-        print(f"Failed to parse config: {exc}")
+        print(f"Config error: {exc}")
         await websocket.close(code=1011)
         return
 
-    session = StreamSession(
-        model=get_model(),
-        exercise=config.get("exercise"),
-        send_interval=float(config.get("send_interval", 2.0)),
-        window_seconds=float(config.get("window_seconds", 2.0)),
-        sampled_images=int(config.get("sampled_images", 4)),
-        jpeg_quality=int(config.get("jpeg_quality", 70)),
-        conf_threshold=float(config.get("conf_threshold", 0.3)),
+    session = CoachSession(
+        exercise=cfg.get("exercise"),
+        coach_interval=float(cfg.get("coach_interval", _COACH_INTERVAL)),
     )
-    print(f"Session started — exercise={session.exercise}, "
-          f"interval={session.send_interval}s, window={session.send_interval}s")
+    print(f"Session opened — exercise={session.exercise!r}")
 
     try:
         while True:
             message = await websocket.receive()
-
-            # Exercise change.
-            if "text" in message:
-                update = json.loads(message["text"])
-                if "exercise" in update:
-                    session.set_exercise(update["exercise"])
-                    print(f"Exercise changed → {session.exercise}")
+            if "text" not in message:
                 continue
 
-            jpeg_bytes = message.get("bytes")
-            if not jpeg_bytes:
-                continue
+            update = json.loads(message["text"])
 
-            # Run inference off the event loop.
-            await loop.run_in_executor(_executor, session.infer, jpeg_bytes)
+            if "exercise" in update:
+                session.set_exercise(update["exercise"])
 
-            # Flush the window to the client if it's time.
-            batch = session.try_flush()
-            if batch is not None:
-                await websocket.send_text(batch.to_json())
+            elif update.get("type") == "question" and update.get("text"):
+                if _GEMINI_OK and _gemini_client:
+                    answer = await _answer_question(update["text"], session.exercise)
+                    print(f"Q: {update['text']!r}  →  A: {answer!r}")
+                    await websocket.send_text(json.dumps({"type": "answer", "text": answer}))
 
-    except WebSocketDisconnect:
-        print(f"Client disconnected — exercise={session.exercise}")
-    except Exception as exc:
-        import traceback
-        print(f"Session error: {exc}")
-        traceback.print_exc()
-        await websocket.close(code=1011)
+            elif update.get("type") == "keypoints" and update.get("text"):
+                session.add_snapshot(update["text"])
+                session.start_coach_if_due()
+                coach_text = session.poll_coach()
+                if coach_text:
+                    print(f"Coach [{session.exercise}]: {coach_text!r}")
+                    await websocket.send_text(
+                        json.dumps({"type": "coach", "text": coach_text})
+                    )
+
+    except (WebSocketDisconnect, RuntimeError):
+        print(f"Session closed — exercise={session.exercise!r}")
